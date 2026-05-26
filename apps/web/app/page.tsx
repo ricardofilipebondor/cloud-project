@@ -1,6 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { Badge, Button, Card, Field, Input, Select, Spinner } from "./components/ui";
+import { clearStoredToken, getStoredToken } from "@/lib/authClient";
 
 type Job = {
   job_id: string;
@@ -10,15 +13,52 @@ type Job = {
   created_at: string;
 };
 
-export default function HomePage() {
-  const [email, setEmail] = useState("demo@streamsync.ai");
-  const [password, setPassword] = useState("demo123");
-  const [token, setToken] = useState("");
-  const [url, setUrl] = useState("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+const LANGUAGES: Record<string, string> = {
+  ro: "Romanian",
+  en: "English",
+  fr: "French",
+  de: "German",
+  es: "Spanish"
+};
+
+function statusVariant(status: string): "pending" | "processing" | "completed" | "failed" | "default" {
+  const s = status.toUpperCase();
+  if (s === "COMPLETED") return "completed";
+  if (s === "FAILED") return "failed";
+  if (s === "PROCESSING" || s === "RUNNING") return "processing";
+  if (s === "PENDING" || s === "QUEUED") return "pending";
+  return "default";
+}
+
+function parseEmailFromToken(token: string): string | null {
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1] ?? ""));
+    return typeof payload.email === "string" ? payload.email : null;
+  } catch {
+    return null;
+  }
+}
+
+export default function DashboardPage() {
+  const router = useRouter();
+  const [token, setToken] = useState<string | null>(null);
+  const [url, setUrl] = useState("");
   const [language, setLanguage] = useState("ro");
   const [jobs, setJobs] = useState<Job[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    const stored = getStoredToken();
+    if (!stored) {
+      router.replace("/login");
+      return;
+    }
+    setToken(stored);
+  }, [router]);
+
+  const userEmail = token ? parseEmailFromToken(token) : null;
 
   const api = useMemo(
     () => async (path: string, init: RequestInit = {}) => {
@@ -27,60 +67,49 @@ export default function HomePage() {
         ...(init.headers as Record<string, string> | undefined)
       };
       if (token) headers.Authorization = `Bearer ${token}`;
-      const response = await fetch(path, { ...init, headers });
-      return response;
+      return fetch(path, { ...init, headers });
     },
     [token]
   );
 
-  async function login() {
-    setError("");
-    setLoading(true);
-    try {
-      const response = await api("/api/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ email, password })
-      });
-      if (!response.ok) throw new Error("Login failed");
-      const data = await response.json();
-      setToken(data.token);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
-    } finally {
-      setLoading(false);
-    }
-  }
-
   const loadJobs = useCallback(async () => {
     if (!token) return;
     const response = await api("/api/jobs");
+    if (response.status === 401) {
+      clearStoredToken();
+      router.replace("/login");
+      return;
+    }
     if (!response.ok) return;
     const data = await response.json();
     setJobs(data);
-  }, [token, api]);
+  }, [token, api, router]);
 
-  async function createJob() {
+  async function createJob(e: React.FormEvent) {
+    e.preventDefault();
+    if (!url.trim()) return;
     setError("");
-    setLoading(true);
+    setSubmitting(true);
     try {
       const response = await api("/api/jobs/create", {
         method: "POST",
-        body: JSON.stringify({ source_url: url, target_language: language })
+        body: JSON.stringify({ source_url: url.trim(), target_language: language })
       });
-      if (!response.ok) throw new Error("Failed to create job");
+      if (!response.ok) throw new Error("Could not create job");
+      setUrl("");
       await loadJobs();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
-      setLoading(false);
+      setSubmitting(false);
     }
   }
 
   async function deleteJob(jobId: string) {
+    setLoading(true);
     const response = await api(`/api/jobs/${jobId}`, { method: "DELETE" });
-    if (response.ok) {
-      await loadJobs();
-    }
+    if (response.ok) await loadJobs();
+    setLoading(false);
   }
 
   async function downloadSubtitles(jobId: string, format: "srt" | "vtt") {
@@ -94,15 +123,20 @@ export default function HomePage() {
         throw new Error((data as { error?: string }).error ?? "Download failed");
       }
       const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
+      const objectUrl = URL.createObjectURL(blob);
       const link = document.createElement("a");
-      link.href = url;
+      link.href = objectUrl;
       link.download = `${jobId}.${format}`;
       link.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Download failed");
+      URL.revokeObjectURL(objectUrl);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Download failed");
     }
+  }
+
+  function logout() {
+    clearStoredToken();
+    router.replace("/login");
   }
 
   useEffect(() => {
@@ -112,80 +146,125 @@ export default function HomePage() {
     return () => clearInterval(id);
   }, [token, loadJobs]);
 
+  if (!token) {
+    return (
+      <div className="shell shell-center">
+        <Spinner />
+      </div>
+    );
+  }
+
   return (
-    <main>
-      <h1>StreamSync AI</h1>
-      <p>
-        Submit a video URL, process subtitles asynchronously, and download .srt/.vtt when completed.
-      </p>
-
-      <div className="card">
-        <h3>1) Authenticate</h3>
-        <div className="row">
-          <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="email" />
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="password"
-          />
-        </div>
-        <button onClick={login} disabled={loading}>
-          Login
-        </button>
-        <small>{token ? "Authenticated" : "Not authenticated"}</small>
-      </div>
-
-      <div className="card">
-        <h3>2) Create Job</h3>
-        <div className="row">
-          <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="Video URL" />
-          <select value={language} onChange={(e) => setLanguage(e.target.value)}>
-            <option value="ro">Romanian</option>
-            <option value="en">English</option>
-            <option value="fr">French</option>
-            <option value="de">German</option>
-            <option value="es">Spanish</option>
-          </select>
-        </div>
-        <button onClick={createJob} disabled={!token || loading}>
-          Submit URL
-        </button>
-      </div>
-
-      <div className="card">
-        <h3>3) Jobs</h3>
-        {jobs.length === 0 && <small>No jobs yet</small>}
-        {jobs.map((job) => (
-          <div key={job.job_id} className="card" style={{ marginBottom: "0.6rem" }}>
-            <div>
-              <strong>{job.status}</strong> - {job.target_language}
-            </div>
-            <small>{job.source_url}</small>
-            <div className="row" style={{ marginTop: "0.5rem" }}>
-              <button
-                className="secondary"
-                disabled={job.status !== "COMPLETED"}
-                onClick={() => downloadSubtitles(job.job_id, "srt")}
-              >
-                Download SRT
-              </button>
-              <button
-                className="secondary"
-                disabled={job.status !== "COMPLETED"}
-                onClick={() => downloadSubtitles(job.job_id, "vtt")}
-              >
-                Download VTT
-              </button>
-              <button className="secondary" onClick={() => deleteJob(job.job_id)}>
-                Delete
-              </button>
-            </div>
+    <div className="shell">
+      <header className="topbar">
+        <div className="topbar-inner">
+          <div className="brand">
+            <span className="brand-mark">S</span>
+            <span>StreamSync</span>
           </div>
-        ))}
-      </div>
+          <div className="user-menu">
+            {userEmail && <span className="user-email">{userEmail}</span>}
+            <Button variant="ghost" className="btn-sm" onClick={logout}>
+              Sign out
+            </Button>
+          </div>
+        </div>
+      </header>
 
-      {error && <p style={{ color: "#ffadad" }}>{error}</p>}
-    </main>
+      <main className="page container container-wide">
+        <div className="page-header">
+          <h1>Subtitles</h1>
+          <p>Paste a video URL and download .srt or .vtt when processing completes.</p>
+        </div>
+
+        {error && <div className="alert alert-error">{error}</div>}
+
+        <section className="section">
+          <h2 className="section-title">New job</h2>
+          <Card>
+            <form onSubmit={createJob}>
+              <div className="form-row">
+                <Field label="Video URL" hint="YouTube or other supported sources">
+                  <Input
+                    type="url"
+                    value={url}
+                    onChange={(e) => setUrl(e.target.value)}
+                    placeholder="https://www.youtube.com/watch?v=…"
+                    required
+                  />
+                </Field>
+                <Field label="Language">
+                  <Select value={language} onChange={(e) => setLanguage(e.target.value)}>
+                    {Object.entries(LANGUAGES).map(([code, name]) => (
+                      <option key={code} value={code}>
+                        {name}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              </div>
+              <Button type="submit" disabled={submitting || !url.trim()}>
+                {submitting ? (
+                  <>
+                    <Spinner /> Submitting…
+                  </>
+                ) : (
+                  "Generate subtitles"
+                )}
+              </Button>
+            </form>
+          </Card>
+        </section>
+
+        <section className="section">
+          <h2 className="section-title">Your jobs</h2>
+          <Card className="card-flush">
+            {jobs.length === 0 ? (
+              <div className="jobs-empty">No jobs yet. Submit a URL above to get started.</div>
+            ) : (
+              <ul className="job-list">
+                {jobs.map((job) => (
+                  <li key={job.job_id} className="job-item">
+                    <div className="job-meta">
+                      <div>
+                        <Badge status={statusVariant(job.status)}>{job.status}</Badge>
+                        <div className="job-lang">{LANGUAGES[job.target_language] ?? job.target_language}</div>
+                      </div>
+                    </div>
+                    <div className="job-url">{job.source_url}</div>
+                    <div className="job-actions">
+                      <Button
+                        variant="secondary"
+                        className="btn-sm"
+                        disabled={job.status !== "COMPLETED"}
+                        onClick={() => downloadSubtitles(job.job_id, "srt")}
+                      >
+                        SRT
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        className="btn-sm"
+                        disabled={job.status !== "COMPLETED"}
+                        onClick={() => downloadSubtitles(job.job_id, "vtt")}
+                      >
+                        VTT
+                      </Button>
+                      <Button
+                        variant="danger"
+                        className="btn-sm"
+                        disabled={loading}
+                        onClick={() => deleteJob(job.job_id)}
+                      >
+                        Delete
+                      </Button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Card>
+        </section>
+      </main>
+    </div>
   );
 }
