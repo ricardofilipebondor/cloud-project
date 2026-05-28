@@ -20,8 +20,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
     return NextResponse.json({ token });
-  } catch (error) {
-    console.error("Login endpoint failed", error);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+  } catch {
+    return NextResponse.json({ error: "Bad request" }, { status: 400 });
   }
 }

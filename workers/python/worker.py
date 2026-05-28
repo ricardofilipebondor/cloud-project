@@ -1,10 +1,12 @@
 import json
 import os
+import shutil
+import subprocess
 import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import psycopg
 from dotenv import load_dotenv
@@ -17,11 +19,11 @@ QUEUE_PROVIDER = os.getenv("QUEUE_PROVIDER", "local")
 STORAGE_PROVIDER = os.getenv("STORAGE_PROVIDER", "local")
 POLL_INTERVAL_MS = int(os.getenv("WORKER_POLL_INTERVAL_MS", "2000"))
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "")
-GCS_TEMP_PREFIX = os.getenv("GCS_TEMP_PREFIX", "tmp/audio")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "")
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
 OPENAI_TRANSLATE_MODEL = os.getenv("OPENAI_TRANSLATE_MODEL", "gpt-4o-mini")
+OPENAI_TRANSCRIBE_MAX_BYTES = int(os.getenv("OPENAI_TRANSCRIBE_MAX_BYTES", str(24 * 1024 * 1024)))
 DEFAULT_WORKER_TEMP_DIR = Path(__file__).resolve().parent / "tmp"
 WORKER_TEMP_DIR_RAW = os.getenv("WORKER_TEMP_DIR", str(DEFAULT_WORKER_TEMP_DIR))
 FFMPEG_LOCATION = os.getenv("FFMPEG_LOCATION", "")
@@ -131,6 +133,59 @@ def cleanup_file(file_path: Path):
         pass
 
 
+def resolve_ffmpeg_executable() -> str:
+    if FFMPEG_LOCATION:
+        ffmpeg_path = Path(FFMPEG_LOCATION)
+        if ffmpeg_path.is_file():
+            return str(ffmpeg_path)
+        if ffmpeg_path.is_dir():
+            candidate = ffmpeg_path / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+            if candidate.exists():
+                return str(candidate)
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def prepare_audio_for_transcription(audio_path: Path, job_id: str) -> Tuple[Path, Optional[Path]]:
+    if audio_path.stat().st_size <= OPENAI_TRANSCRIBE_MAX_BYTES:
+        return audio_path, None
+
+    compressed_path = WORKER_TEMP_DIR / f"{job_id}-whisper.mp3"
+    ffmpeg = resolve_ffmpeg_executable()
+    try:
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-i",
+                str(audio_path),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-b:a",
+                "64k",
+                str(compressed_path),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError as ex:
+        raise RuntimeError("Audio file is too large for Whisper and FFmpeg is not installed.") from ex
+    except subprocess.CalledProcessError as ex:
+        stderr = (ex.stderr or "").strip()
+        raise RuntimeError(f"Audio file is too large for Whisper and FFmpeg compression failed: {stderr}") from ex
+
+    if compressed_path.stat().st_size > OPENAI_TRANSCRIBE_MAX_BYTES:
+        cleanup_file(compressed_path)
+        raise RuntimeError("Audio file is still too large for Whisper after FFmpeg compression.")
+
+    print(f"Compressed audio for Whisper: {audio_path.name} -> {compressed_path.name}")
+    return compressed_path, compressed_path
+
+
 def _find_downloaded_audio(job_id: str, ext: Optional[str] = None) -> Optional[Path]:
     if ext:
         candidate = WORKER_TEMP_DIR / f"{job_id}.{ext}"
@@ -143,7 +198,24 @@ def _find_downloaded_audio(job_id: str, ext: Optional[str] = None) -> Optional[P
     return matches[0] if matches else None
 
 
-def download_audio(source_url: str, job_id: str) -> Optional[Path]:
+def _to_download_error_message(ex: Exception) -> str:
+    msg = str(ex).strip()
+    lowered = msg.lower()
+    if "cloudflare anti-bot challenge" in lowered or "http error 403" in lowered:
+        return (
+            "Download blocked by Cloudflare (HTTP 403). "
+            "Install yt-dlp impersonation dependency and retry with "
+            '--extractor-args "generic:impersonate".'
+        )
+    if "ffmpeg" in lowered:
+        return (
+            "Nu s-a putut procesa audio-ul cu FFmpeg. "
+            "Instaleaza FFmpeg (winget install ffmpeg) sau seteaza FFMPEG_LOCATION in .env."
+        )
+    return f"Nu s-a putut descarca audio-ul: {msg or 'unknown error'}"
+
+
+def download_audio(source_url: str, job_id: str) -> Tuple[Optional[Path], Optional[str]]:
     """Download audio from URL. Tries without ffmpeg first, then optional MP3 conversion."""
     output_template = str(WORKER_TEMP_DIR / f"{job_id}.%(ext)s")
     base_opts: dict = {
@@ -152,11 +224,15 @@ def download_audio(source_url: str, job_id: str) -> Optional[Path]:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "extractor_args": {"generic": {"impersonate": ["chrome"]}},
     }
     if FFMPEG_LOCATION:
         base_opts["ffmpeg_location"] = FFMPEG_LOCATION
 
     # 1) Direct audio download (no ffmpeg post-processing)
+    direct_error: Optional[str] = None
+    mp3_error: Optional[str] = None
+
     try:
         with YoutubeDL(base_opts) as ydl:
             info = ydl.extract_info(source_url, download=True)
@@ -164,8 +240,9 @@ def download_audio(source_url: str, job_id: str) -> Optional[Path]:
         found = _find_downloaded_audio(job_id, ext)
         if found:
             print(f"Audio downloaded for {job_id}: {found.name}")
-            return found
+            return found, None
     except Exception as ex:
+        direct_error = _to_download_error_message(ex)
         print(f"Audio download (direct) failed for {job_id}: {ex}")
 
     # 2) Optional: convert to mp3 if ffmpeg is available
@@ -186,19 +263,22 @@ def download_audio(source_url: str, job_id: str) -> Optional[Path]:
         found = _find_downloaded_audio(job_id, "mp3")
         if found:
             print(f"Audio downloaded (mp3) for {job_id}: {found.name}")
-            return found
+            return found, None
     except Exception as ex:
+        mp3_error = _to_download_error_message(ex)
         print(f"Audio download (ffmpeg/mp3) failed for {job_id}: {ex}")
 
-    return None
+    return None, mp3_error or direct_error
 
 
-def transcribe_with_openai(audio_path: Path) -> Optional[list[dict]]:
+def transcribe_with_openai(audio_path: Path, job_id: str) -> Optional[list[dict]]:
     if not OPENAI_API_KEY:
         return None
+    prepared_audio: Optional[Path] = None
     try:
         from openai import OpenAI
 
+        audio_path, prepared_audio = prepare_audio_for_transcription(audio_path, job_id)
         client = OpenAI(api_key=OPENAI_API_KEY)
         with audio_path.open("rb") as audio_file:
             transcript = client.audio.transcriptions.create(
@@ -220,6 +300,9 @@ def transcribe_with_openai(audio_path: Path) -> Optional[list[dict]]:
             return segments
     except Exception as ex:
         print(f"Whisper transcription failed: {ex}")
+    finally:
+        if prepared_audio:
+            cleanup_file(prepared_audio)
     return None
 
 
@@ -232,6 +315,8 @@ def translate_with_deepl(segments: list[dict], target_language: str) -> Optional
         translator = deepl.Translator(DEEPL_API_KEY)
         translated = []
         deepl_lang = target_language.upper()
+        if deepl_lang == "EN":
+            deepl_lang = "EN-US"
         for seg in segments:
             result = translator.translate_text(seg["text"], target_lang=deepl_lang)
             translated.append({**seg, "text": str(result.text)})
@@ -309,82 +394,48 @@ def save_local_file(relative_path: str, content: str):
     full_path.write_text(content, encoding="utf-8")
 
 
-def upload_temp_audio_to_gcs(local_audio_path: Path, job_id: str) -> Optional[str]:
-    if STORAGE_PROVIDER != "gcs" or not GCS_BUCKET_NAME:
-        return None
-
-    from google.cloud import storage
-
-    temp_name = f"{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}{local_audio_path.suffix}"
-    temp_path = f"{GCS_TEMP_PREFIX.strip('/')}/{job_id}/{temp_name}"
-    client = storage.Client()
-    bucket = client.bucket(GCS_BUCKET_NAME)
-    blob = bucket.blob(temp_path)
-    blob.upload_from_filename(str(local_audio_path))
-    print(f"Uploaded temp audio to gs://{GCS_BUCKET_NAME}/{temp_path}")
-    return temp_path
-
-
-def delete_gcs_file(storage_path: str):
-    if not storage_path or not GCS_BUCKET_NAME:
-        return
-    try:
-        from google.cloud import storage
-
-        client = storage.Client()
-        bucket = client.bucket(GCS_BUCKET_NAME)
-        bucket.blob(storage_path).delete()
-    except Exception as ex:
-        print(f"Failed to delete temp GCS file {storage_path}: {ex}")
-
-
 def process_job(job_id: str, source_url: str, target_language: str):
     use_real_ai = bool(OPENAI_API_KEY)
-    temp_audio_gcs_path: Optional[str] = None
 
     update_job(job_id, "PROCESSING", 10)
-    audio_file = download_audio(source_url, job_id)
+    audio_file, download_error = download_audio(source_url, job_id)
 
     if use_real_ai and not audio_file:
-        raise RuntimeError(
-            "Nu s-a putut descarca audio-ul. Instaleaza FFmpeg (winget install ffmpeg) "
-            "sau seteaza FFMPEG_LOCATION in .env, apoi reporneste worker-ul."
-        )
-
-    segments: list[dict]
-    if audio_file:
-        temp_audio_gcs_path = upload_temp_audio_to_gcs(audio_file, job_id)
-        transcribed = transcribe_with_openai(audio_file)
-        if transcribed:
-            segments = transcribed
-        elif use_real_ai:
-            raise RuntimeError("Whisper nu a returnat transcriere. Verifica OPENAI_API_KEY si creditul API.")
-        else:
-            segments = mock_transcribe(source_url)
-    else:
-        segments = mock_transcribe(source_url)
-
-    update_job(job_id, "PROCESSING", 50)
-    time.sleep(0.2)
-
-    if use_real_ai:
-        translated_segments = (
-            translate_with_deepl(segments, target_language)
-            or translate_with_openai(segments, target_language)
-        )
-        if not translated_segments:
-            raise RuntimeError("Traducerea a esuat (DeepL si OpenAI).")
-    else:
-        translated_segments = mock_translate(segments, target_language)
-    srt_content = to_srt(translated_segments)
-    vtt_content = to_vtt(translated_segments)
-
-    now = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-    prefix = f"jobs/{job_id}/{now}-{uuid.uuid4().hex[:8]}"
-    srt_path = f"{prefix}.srt"
-    vtt_path = f"{prefix}.vtt"
+        raise RuntimeError(download_error or "Nu s-a putut descarca audio-ul.")
 
     try:
+        segments: list[dict]
+        if audio_file:
+            transcribed = transcribe_with_openai(audio_file, job_id)
+            if transcribed:
+                segments = transcribed
+            elif use_real_ai:
+                raise RuntimeError("Whisper nu a returnat transcriere. Verifica OPENAI_API_KEY si creditul API.")
+            else:
+                segments = mock_transcribe(source_url)
+        else:
+            segments = mock_transcribe(source_url)
+
+        update_job(job_id, "PROCESSING", 50)
+        time.sleep(0.2)
+
+        if use_real_ai:
+            translated_segments = (
+                translate_with_deepl(segments, target_language)
+                or translate_with_openai(segments, target_language)
+            )
+            if not translated_segments:
+                raise RuntimeError("Traducerea a esuat (DeepL si OpenAI).")
+        else:
+            translated_segments = mock_translate(segments, target_language)
+        srt_content = to_srt(translated_segments)
+        vtt_content = to_vtt(translated_segments)
+
+        now = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        prefix = f"jobs/{job_id}/{now}-{uuid.uuid4().hex[:8]}"
+        srt_path = f"{prefix}.srt"
+        vtt_path = f"{prefix}.vtt"
+
         if STORAGE_PROVIDER == "local":
             save_local_file(srt_path, srt_content)
             save_local_file(vtt_path, vtt_content)
@@ -398,8 +449,6 @@ def process_job(job_id: str, source_url: str, target_language: str):
     finally:
         if audio_file:
             cleanup_file(audio_file)
-        if temp_audio_gcs_path:
-            delete_gcs_file(temp_audio_gcs_path)
 
     update_job(job_id, "COMPLETED", 100, None, srt_path=srt_path, vtt_path=vtt_path)
 

@@ -25,6 +25,17 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid request" }, { status: 400 });
   }
 
+  const existingUser = await db.query<{ id: string }>(
+    "SELECT id FROM users WHERE id = $1",
+    [user.id]
+  );
+  if (!existingUser.rows[0]) {
+    return NextResponse.json(
+      { error: "User no longer exists in current database. Please login again." },
+      { status: 401 }
+    );
+  }
+
   const insert = await db.query<{ id: string }>(
     `INSERT INTO jobs (user_id, source_url, target_language, status, progress_percentage)
      VALUES ($1, $2, $3, 'PENDING', 0)
