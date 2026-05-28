@@ -17,14 +17,30 @@ QUEUE_PROVIDER = os.getenv("QUEUE_PROVIDER", "local")
 STORAGE_PROVIDER = os.getenv("STORAGE_PROVIDER", "local")
 POLL_INTERVAL_MS = int(os.getenv("WORKER_POLL_INTERVAL_MS", "2000"))
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "")
+GCS_TEMP_PREFIX = os.getenv("GCS_TEMP_PREFIX", "tmp/audio")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "")
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
 OPENAI_TRANSLATE_MODEL = os.getenv("OPENAI_TRANSLATE_MODEL", "gpt-4o-mini")
-WORKER_TEMP_DIR = Path(os.getenv("WORKER_TEMP_DIR", str(Path(__file__).resolve().parent / "tmp")))
+DEFAULT_WORKER_TEMP_DIR = Path(__file__).resolve().parent / "tmp"
+WORKER_TEMP_DIR_RAW = os.getenv("WORKER_TEMP_DIR", str(DEFAULT_WORKER_TEMP_DIR))
 FFMPEG_LOCATION = os.getenv("FFMPEG_LOCATION", "")
 
 LOCAL_STORAGE_ROOT = Path(__file__).resolve().parents[2] / "local_storage"
+
+
+def resolve_local_temp_dir(raw_dir: str) -> Path:
+    """
+    yt-dlp requires a local filesystem path for downloads.
+    If someone configures gs:// here, we still need a local temp folder.
+    """
+    if raw_dir.strip().lower().startswith("gs://"):
+        print(f"Ignoring gs:// WORKER_TEMP_DIR for local temp audio: {raw_dir}")
+        return DEFAULT_WORKER_TEMP_DIR
+    return Path(raw_dir)
+
+
+WORKER_TEMP_DIR = resolve_local_temp_dir(WORKER_TEMP_DIR_RAW)
 LOCAL_STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
 WORKER_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -293,8 +309,38 @@ def save_local_file(relative_path: str, content: str):
     full_path.write_text(content, encoding="utf-8")
 
 
+def upload_temp_audio_to_gcs(local_audio_path: Path, job_id: str) -> Optional[str]:
+    if STORAGE_PROVIDER != "gcs" or not GCS_BUCKET_NAME:
+        return None
+
+    from google.cloud import storage
+
+    temp_name = f"{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}{local_audio_path.suffix}"
+    temp_path = f"{GCS_TEMP_PREFIX.strip('/')}/{job_id}/{temp_name}"
+    client = storage.Client()
+    bucket = client.bucket(GCS_BUCKET_NAME)
+    blob = bucket.blob(temp_path)
+    blob.upload_from_filename(str(local_audio_path))
+    print(f"Uploaded temp audio to gs://{GCS_BUCKET_NAME}/{temp_path}")
+    return temp_path
+
+
+def delete_gcs_file(storage_path: str):
+    if not storage_path or not GCS_BUCKET_NAME:
+        return
+    try:
+        from google.cloud import storage
+
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET_NAME)
+        bucket.blob(storage_path).delete()
+    except Exception as ex:
+        print(f"Failed to delete temp GCS file {storage_path}: {ex}")
+
+
 def process_job(job_id: str, source_url: str, target_language: str):
     use_real_ai = bool(OPENAI_API_KEY)
+    temp_audio_gcs_path: Optional[str] = None
 
     update_job(job_id, "PROCESSING", 10)
     audio_file = download_audio(source_url, job_id)
@@ -307,6 +353,7 @@ def process_job(job_id: str, source_url: str, target_language: str):
 
     segments: list[dict]
     if audio_file:
+        temp_audio_gcs_path = upload_temp_audio_to_gcs(audio_file, job_id)
         transcribed = transcribe_with_openai(audio_file)
         if transcribed:
             segments = transcribed
@@ -337,19 +384,22 @@ def process_job(job_id: str, source_url: str, target_language: str):
     srt_path = f"{prefix}.srt"
     vtt_path = f"{prefix}.vtt"
 
-    if STORAGE_PROVIDER == "local":
-        save_local_file(srt_path, srt_content)
-        save_local_file(vtt_path, vtt_content)
-    else:
-        from google.cloud import storage
+    try:
+        if STORAGE_PROVIDER == "local":
+            save_local_file(srt_path, srt_content)
+            save_local_file(vtt_path, vtt_content)
+        else:
+            from google.cloud import storage
 
-        client = storage.Client()
-        bucket = client.bucket(GCS_BUCKET_NAME)
-        bucket.blob(srt_path).upload_from_string(srt_content, content_type="text/plain; charset=utf-8")
-        bucket.blob(vtt_path).upload_from_string(vtt_content, content_type="text/plain; charset=utf-8")
-
-    if audio_file:
-        cleanup_file(audio_file)
+            client = storage.Client()
+            bucket = client.bucket(GCS_BUCKET_NAME)
+            bucket.blob(srt_path).upload_from_string(srt_content, content_type="text/plain; charset=utf-8")
+            bucket.blob(vtt_path).upload_from_string(vtt_content, content_type="text/plain; charset=utf-8")
+    finally:
+        if audio_file:
+            cleanup_file(audio_file)
+        if temp_audio_gcs_path:
+            delete_gcs_file(temp_audio_gcs_path)
 
     update_job(job_id, "COMPLETED", 100, None, srt_path=srt_path, vtt_path=vtt_path)
 
